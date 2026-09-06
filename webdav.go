@@ -48,8 +48,10 @@ const (
 	// tempDirPerm is the permission used when creating the temp directory.
 	tempDirPerm = 0o755
 
-	// defaultFilePerm is the permission for a copy-fallback target when
-	// no previous target file exists to inherit permissions from.
+	// defaultFilePerm is the permission for newly created files on both
+	// the rename and the copy-fallback paths, used when no previous
+	// target file exists to inherit permissions from. It matches the
+	// result of a direct write under the common umask 022.
 	defaultFilePerm = 0o644
 
 	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB).
@@ -421,13 +423,17 @@ func (fsys *atomicFS) resolve(name string) string {
 
 // atomicFile wraps a staged temp file and publishes it to the final
 // path only when Close() is called after a fully successful write.
+//
+// A single instance serves exactly one request: Write and Close are
+// called sequentially from the same handler goroutine, so no locking
+// is needed. The closed flag only guards against a hypothetical double
+// Close by the handler, keeping the method idempotent.
 type atomicFile struct {
 	webdav.File
 	tmpPath   string
 	finalPath string
 	logger    *zap.Logger
 	tracker   *bodyTracker
-	mu        sync.Mutex
 	written   int64
 	writeErr  error
 	closed    bool
@@ -435,21 +441,16 @@ type atomicFile struct {
 
 func (f *atomicFile) Write(p []byte) (int, error) {
 	n, err := f.File.Write(p)
-	f.mu.Lock()
 	f.written += int64(n)
 	if err != nil {
 		f.writeErr = err
 	}
-	f.mu.Unlock()
 	return n, err
 }
 
 // Close publishes the staged file. If any earlier write failed, the
 // fragment is discarded and the final path is never touched.
 func (f *atomicFile) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	if f.closed {
 		return nil
 	}
@@ -475,13 +476,16 @@ func (f *atomicFile) Close() error {
 	}
 
 	// A failed write means the temp file is incomplete; discard it
-	// without publishing.
+	// without publishing. The write error is the root cause and takes
+	// precedence; a secondary close failure is only logged.
 	if f.writeErr != nil {
-		closeErr := f.File.Close()
-		_ = os.Remove(f.tmpPath)
-		if closeErr != nil {
-			return closeErr
+		if closeErr := f.File.Close(); closeErr != nil {
+			f.logger.Warn("could not close temp file after write failure",
+				zap.String("path", f.tmpPath),
+				zap.Error(closeErr),
+			)
 		}
+		_ = os.Remove(f.tmpPath)
 		return f.writeErr
 	}
 
