@@ -20,6 +20,7 @@ package webdav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -63,6 +64,35 @@ const (
 // avoid per-upload heap allocations.
 var copyBufPool = sync.Pool{
 	New: func() any { return make([]byte, copyBufferSize) },
+}
+
+// bodyTrackerCtxKey is the context key carrying the per-request upload
+// body tracker from ServeHTTP down to atomicFile.
+type bodyTrackerCtxKey struct{}
+
+// bodyTracker records read-side failures and the declared content
+// length for a single upload request, so that atomicFile.Close can
+// detect incomplete uploads that never produce a write-side error
+// (client disconnects, truncated bodies).
+type bodyTracker struct {
+	err           error
+	contentLength int64
+}
+
+// trackingReadCloser wraps the request body and records any read
+// failure into the tracker. It is a zero-overhead passthrough as long
+// as reads succeed.
+type trackingReadCloser struct {
+	io.ReadCloser
+	tracker *bodyTracker
+}
+
+func (rc *trackingReadCloser) Read(p []byte) (int, error) {
+	n, err := rc.ReadCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		rc.tracker.err = err
+	}
+	return n, err
 }
 
 func init() {
@@ -221,6 +251,17 @@ func (wd *WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	prefix := repl.ReplaceAll(wd.Prefix, "")
 
+	// For PUT uploads, wrap the request body so read-side failures
+	// (client disconnects, truncated transfers) become visible to the
+	// atomic file's Close, which would otherwise only see write-side
+	// errors and could publish a partial file.
+	if r.Method == http.MethodPut {
+		tracker := &bodyTracker{contentLength: r.ContentLength}
+		r.Body = &trackingReadCloser{ReadCloser: r.Body, tracker: tracker}
+
+		r = r.WithContext(context.WithValue(r.Context(), bodyTrackerCtxKey{}, tracker))
+	}
+
 	// One-time lazy initialization of the temp directory. A persisted
 	// initialization error fails every request fast with HTTP 500.
 	wd.initOnce.Do(func() { wd.lazyInit(repl) })
@@ -349,11 +390,17 @@ func (fsys *atomicFS) OpenFile(ctx context.Context, name string, flag int, perm 
 		return nil, err
 	}
 
+	// Pick up the per-request body tracker injected by ServeHTTP. It is
+	// absent (nil) for non-PUT requests, in which case Close simply
+	// skips the read-side checks.
+	tracker, _ := ctx.Value(bodyTrackerCtxKey{}).(*bodyTracker)
+
 	return &atomicFile{
 		File:      tmpFile,
 		tmpPath:   tmpFile.Name(),
 		finalPath: fsys.resolve(name),
 		logger:    fsys.logger,
+		tracker:   tracker,
 	}, nil
 }
 
@@ -371,18 +418,21 @@ type atomicFile struct {
 	tmpPath   string
 	finalPath string
 	logger    *zap.Logger
+	tracker   *bodyTracker
 	mu        sync.Mutex
+	written   int64
 	writeErr  error
 	closed    bool
 }
 
 func (f *atomicFile) Write(p []byte) (int, error) {
 	n, err := f.File.Write(p)
+	f.mu.Lock()
+	f.written += int64(n)
 	if err != nil {
-		f.mu.Lock()
 		f.writeErr = err
-		f.mu.Unlock()
 	}
+	f.mu.Unlock()
 	return n, err
 }
 
@@ -396,6 +446,25 @@ func (f *atomicFile) Close() error {
 		return nil
 	}
 	f.closed = true
+
+	// A read-side failure on the request body (client disconnect,
+	// truncated transfer) means the staged file is incomplete even
+	// though no write ever failed; discard it without publishing.
+	if f.tracker != nil && f.tracker.err != nil {
+		_ = f.File.Close()
+		_ = os.Remove(f.tmpPath)
+		return f.tracker.err
+	}
+
+	// A declared content length that does not match the bytes written
+	// means the body ended early without surfacing a read error (e.g.
+	// a proxy silently truncated it); discard as well.
+	if f.tracker != nil && f.tracker.contentLength >= 0 && f.written != f.tracker.contentLength {
+		_ = f.File.Close()
+		_ = os.Remove(f.tmpPath)
+		return fmt.Errorf("incomplete upload: declared %d bytes but wrote %d bytes",
+			f.tracker.contentLength, f.written)
+	}
 
 	// A failed write means the temp file is incomplete; discard it
 	// without publishing.
