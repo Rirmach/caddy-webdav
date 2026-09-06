@@ -292,11 +292,19 @@ func (wd *WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				)
 				return
 			}
-
-			wd.logger.Error("internal handler error",
-				zap.Error(err),
-				zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: req}),
-			)
+			// log client-side upload aborts at warn level: they are
+			// routine events, not internal server errors
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				wd.logger.Warn("upload aborted by client",
+					zap.Error(err),
+					zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: req}),
+				)
+			} else {
+				wd.logger.Error("internal handler error",
+					zap.Error(err),
+					zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: req}),
+				)
+			}
 		},
 	}
 
