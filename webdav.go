@@ -162,7 +162,12 @@ func (wd *WebDAV) lazyInit(repl *caddy.Replacer) {
 	}
 	wd.absTempDir = absTempDir
 
-	wd.cleanStaleTempFiles()
+	// Cleanup is best-effort and can be slow on network filesystems
+	// with many leftovers; fire it in the background so the first
+	// request is not blocked. It runs at most once per process
+	// lifetime (guarded by initOnce); files that cannot be removed
+	// are simply left for the next process start.
+	go wd.cleanStaleTempFiles()
 }
 
 // cleanStaleTempFiles removes leftover temp files whose modification
@@ -336,17 +341,11 @@ func (fsys *atomicFS) OpenFile(ctx context.Context, name string, flag int, perm 
 
 	// Stage the upload in a random-named temp file. os.CreateTemp uses
 	// crypto/rand internally; no timestamp-based pseudo-random seed.
+	// The temp file keeps its restrictive 0600 permission while staged;
+	// the final permission bits are applied just before publishing in
+	// Close().
 	tmpFile, err := os.CreateTemp(fsys.absTempDir, "")
 	if err != nil {
-		return nil, err
-	}
-
-	// os.CreateTemp always creates files with 0600; apply the
-	// permission requested by the handler so the published file
-	// matches the semantics of a direct write.
-	if err := tmpFile.Chmod(perm); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
 		return nil, err
 	}
 
@@ -415,9 +414,23 @@ func (f *atomicFile) Close() error {
 		return err
 	}
 
+	// Apply the final permission bits just before publishing. An
+	// existing target passes on its mode; new files get the documented
+	// default (matching the common umask 022 result of a direct write).
+	// os.Chmod bypasses umask, so replicating arbitrary umask semantics
+	// for new files is not possible portably.
+	var perm os.FileMode = defaultFilePerm
+	if info, err := os.Stat(f.finalPath); err == nil {
+		perm = info.Mode()
+	}
+	if err := os.Chmod(f.tmpPath, perm); err != nil {
+		_ = os.Remove(f.tmpPath)
+		return err
+	}
+
 	// Publish atomically. If the temp directory and the destination
 	// live on different file systems, os.Rename fails with EXDEV and
-	// we fall back to copy + metadata restore + delete.
+	// we fall back to a destination-side copy + rename.
 	if err := os.Rename(f.tmpPath, f.finalPath); err != nil {
 		if errors.Is(err, syscall.EXDEV) {
 			copyErr := f.copyFallback()
@@ -432,74 +445,59 @@ func (f *atomicFile) Close() error {
 	return nil
 }
 
-// copyFallback copies the staged temp file to the final destination,
-// restores the previous target's access/modification times and
-// permission bits, then removes the temp source. If the copy fails
-// midway, the incomplete destination file is removed and an error is
-// returned, so readers never see a partial file.
+// copyFallback handles the cross-device case: it copies the staged
+// temp file into a second temp file in the destination directory and
+// atomically renames it over the final path. The previous target (if
+// any) stays completely intact until the final rename; any mid-copy
+// failure only removes the destination-side temp file, so readers
+// never see a partial file and the old content is never lost.
 func (f *atomicFile) copyFallback() error {
-	// Capture metadata of an existing target before overwriting, so
-	// it can be restored onto the new content afterwards.
-	var prevInfo os.FileInfo
-	info, err := os.Stat(f.finalPath)
-	if err == nil {
-		prevInfo = info
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-
-	var perm os.FileMode = defaultFilePerm
-	if prevInfo != nil {
-		perm = prevInfo.Mode()
-	}
-
 	src, err := os.Open(f.tmpPath)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
 
-	dst, err := os.OpenFile(f.finalPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	// Stage the copy in the destination directory so the final rename
+	// always happens within a single filesystem.
+	dstTmp, err := os.CreateTemp(filepath.Dir(f.finalPath), "")
 	if err != nil {
 		return err
 	}
+	dstTmpPath := dstTmp.Name()
 
 	buf := copyBufPool.Get().([]byte)
-	_, copyErr := io.CopyBuffer(dst, src, buf)
+	_, copyErr := io.CopyBuffer(dstTmp, src, buf)
 	copyBufPool.Put(buf)
-	closeErr := dst.Close()
-
+	closeErr := dstTmp.Close()
 	if copyErr != nil || closeErr != nil {
-		// Never leave a partially-copied destination behind.
-		_ = os.Remove(f.finalPath)
+		// Never leave a partially-copied file behind. The previous
+		// target has not been touched at all.
+		_ = os.Remove(dstTmpPath)
 		if copyErr != nil {
 			return copyErr
 		}
 		return closeErr
 	}
 
-	// Restore the original access time, modification time, and
-	// permission bits onto the new content.
-	if prevInfo != nil {
-		atime := prevInfo.ModTime()
-		if st, ok := prevInfo.Sys().(*syscall.Stat_t); ok {
-			atime = time.Unix(st.Atim.Sec, st.Atim.Nsec)
-		}
-		if err := os.Chtimes(f.finalPath, atime, prevInfo.ModTime()); err != nil {
-			f.logger.Warn("could not restore file times after cross-device copy",
-				zap.String("path", f.finalPath),
-				zap.Error(err),
-			)
-		}
-		if err := os.Chmod(f.finalPath, prevInfo.Mode()); err != nil {
-			f.logger.Warn("could not restore file permissions after cross-device copy",
+	// The staged source already carries the final permission bits,
+	// applied by Close before the rename attempt.
+	if srcInfo, err := src.Stat(); err == nil {
+		if err := os.Chmod(dstTmpPath, srcInfo.Mode()); err != nil {
+			f.logger.Warn("could not apply file permissions after cross-device copy",
 				zap.String("path", f.finalPath),
 				zap.Error(err),
 			)
 		}
 	}
 
-	return os.Remove(f.tmpPath)
+	// Atomically replace the target; the old content survives every
+	// failure path above.
+	if err := os.Rename(dstTmpPath, f.finalPath); err != nil {
+		_ = os.Remove(dstTmpPath)
+		return err
+	}
+	return nil
 }
 
 // Interface guards
