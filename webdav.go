@@ -20,8 +20,15 @@ package webdav
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -29,6 +36,34 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
 )
+
+// Configurable values and thresholds for atomic uploads. All tunables
+// live here so no magic numbers are scattered through the code.
+const (
+	// defaultTempDirName is the default temp directory name, created
+	// alongside the resolved Root when TempFileDir is not configured.
+	defaultTempDirName = ".caddy_webdav_temp"
+
+	// tempDirPerm is the permission used when creating the temp directory.
+	tempDirPerm = 0o755
+
+	// defaultFilePerm is the permission for a copy-fallback target when
+	// no previous target file exists to inherit permissions from.
+	defaultFilePerm = 0o644
+
+	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB).
+	copyBufferSize = 1 << 20
+
+	// staleTempFileMaxAge is the age after which leftover temp files are
+	// removed during one-time initialization.
+	staleTempFileMaxAge = 30 * 24 * time.Hour
+)
+
+// copyBufPool recycles 1MB buffers used by the EXDEV copy fallback to
+// avoid per-upload heap allocations.
+var copyBufPool = sync.Pool{
+	New: func() any { return make([]byte, copyBufferSize) },
+}
 
 func init() {
 	caddy.RegisterModule(WebDAV{})
@@ -54,8 +89,24 @@ type WebDAV struct {
 	// Accepts placeholders.
 	Prefix string `json:"prefix,omitempty"`
 
+	// TempFileDir is the directory where uploads are staged as
+	// temporary files before being atomically moved to their final
+	// destination. If empty, it defaults to a ".caddy_webdav_temp"
+	// directory inside the resolved Root. Accepts placeholders.
+	TempFileDir string `json:"temp_file_dir,omitempty"`
+
 	lockSystem webdav.LockSystem
 	logger     *zap.Logger
+
+	// initOnce runs the one-time filesystem initialization lazily on
+	// the first request. It is a pointer so that the struct can be
+	// safely copied by value (e.g. by the CaddyModule value receiver).
+	// initErr persists an initialization failure so every later
+	// request fails fast with HTTP 500.
+	initOnce   *sync.Once
+	initErr    error
+	absRoot    string
+	absTempDir string
 }
 
 // CaddyModule returns the Caddy module information.
@@ -66,9 +117,12 @@ func (WebDAV) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets up the module.
+// Provision sets up the module. It performs no filesystem operations;
+// directory creation and stale temp cleanup are deferred to the first
+// request via initOnce.
 func (wd *WebDAV) Provision(ctx caddy.Context) error {
 	wd.logger = ctx.Logger(wd)
+	wd.initOnce = new(sync.Once)
 
 	wd.lockSystem = webdav.NewMemLS()
 	if wd.Root == "" {
@@ -78,18 +132,100 @@ func (wd *WebDAV) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (wd WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+// lazyInit performs the one-time filesystem initialization: resolving
+// Root and TempFileDir to absolute paths, creating the temp directory,
+// and removing stale leftover temp files. Any fatal failure is stored
+// in initErr; there is intentionally no fallback to the system /tmp.
+func (wd *WebDAV) lazyInit(repl *caddy.Replacer) {
+	root := repl.ReplaceAll(wd.Root, ".")
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		wd.initErr = err
+		return
+	}
+	wd.absRoot = absRoot
+
+	tempDir := repl.ReplaceAll(wd.TempFileDir, "")
+	if tempDir == "" {
+		tempDir = filepath.Join(absRoot, defaultTempDirName)
+	}
+	absTempDir, err := filepath.Abs(tempDir)
+	if err != nil {
+		wd.initErr = err
+		return
+	}
+
+	if err := os.MkdirAll(absTempDir, tempDirPerm); err != nil {
+		wd.initErr = err
+		return
+	}
+	wd.absTempDir = absTempDir
+
+	wd.cleanStaleTempFiles()
+}
+
+// cleanStaleTempFiles removes leftover temp files whose modification
+// time is older than staleTempFileMaxAge. It scans only the top level
+// of the temp directory (temp files never live in subdirectories) and
+// continues past per-file failures, logging them at Warn level.
+func (wd *WebDAV) cleanStaleTempFiles() {
+	entries, err := os.ReadDir(wd.absTempDir)
+	if err != nil {
+		wd.logger.Warn("could not list temp directory for stale file cleanup",
+			zap.String("temp_dir", wd.absTempDir),
+			zap.Error(err),
+		)
+		return
+	}
+
+	for _, entry := range entries {
+		// Subdirectories are not expected in the temp directory;
+		// skip them without recursing.
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			wd.logger.Warn("could not stat temp file during cleanup, skipping",
+				zap.String("temp_dir", wd.absTempDir),
+				zap.String("file", entry.Name()),
+				zap.Error(err),
+			)
+			continue
+		}
+		if time.Since(info.ModTime()) <= staleTempFileMaxAge {
+			continue
+		}
+		if err := os.Remove(filepath.Join(wd.absTempDir, entry.Name())); err != nil {
+			wd.logger.Warn("could not remove stale temp file, skipping",
+				zap.String("temp_dir", wd.absTempDir),
+				zap.String("file", entry.Name()),
+				zap.Error(err),
+			)
+			continue
+		}
+	}
+}
+
+func (wd *WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// TODO: integrate with caddy 2's existing auth features to enforce read-only?
 	// read methods: GET, HEAD, OPTIONS
 	// write methods: POST, PUT, PATCH, DELETE, COPY, MKCOL, MOVE, PROPPATCH
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	root := repl.ReplaceAll(wd.Root, ".")
 	prefix := repl.ReplaceAll(wd.Prefix, "")
+
+	// One-time lazy initialization of the temp directory. A persisted
+	// initialization error fails every request fast with HTTP 500.
+	wd.initOnce.Do(func() { wd.lazyInit(repl) })
+	if wd.initErr != nil {
+		return caddyhttp.Error(http.StatusInternalServerError, wd.initErr)
+	}
 
 	wdHandler := webdav.Handler{
 		Prefix:     prefix,
-		FileSystem: webdav.Dir(root),
+		FileSystem: newAtomicFS(wd.absRoot, wd.absTempDir, wd.logger),
 		LockSystem: wd.lockSystem,
 		Logger: func(req *http.Request, err error) {
 			if err == nil {
@@ -148,6 +284,223 @@ func (wd WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 type emptyBodyResponseWriter struct{ http.ResponseWriter }
 
 func (w emptyBodyResponseWriter) Write(data []byte) (int, error) { return 0, nil }
+
+// ---------- Atomic Upload Support ----------
+
+// atomicFS wraps webdav.Dir so that "create and truncate" writes (PUT
+// uploads) are staged in a temporary file and atomically moved to the
+// final path on Close(). Readers therefore only ever see a complete
+// file or no file at all. All other operations pass through untouched.
+type atomicFS struct {
+	dir        webdav.Dir
+	absRoot    string
+	absTempDir string
+	logger     *zap.Logger
+}
+
+func newAtomicFS(absRoot, absTempDir string, logger *zap.Logger) *atomicFS {
+	return &atomicFS{
+		dir:        webdav.Dir(absRoot),
+		absRoot:    absRoot,
+		absTempDir: absTempDir,
+		logger:     logger,
+	}
+}
+
+func (fsys *atomicFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+	return fsys.dir.Mkdir(ctx, name, perm)
+}
+
+func (fsys *atomicFS) RemoveAll(ctx context.Context, name string) error {
+	return fsys.dir.RemoveAll(ctx, name)
+}
+
+func (fsys *atomicFS) Rename(ctx context.Context, oldName, newName string) error {
+	return fsys.dir.Rename(ctx, oldName, newName)
+}
+
+func (fsys *atomicFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	return fsys.dir.Stat(ctx, name)
+}
+
+func (fsys *atomicFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
+	// Only intercept "create and truncate" writes (fresh PUT uploads).
+	// Appends and partial updates bypass the atomic path.
+	isAtomicWrite := flag&os.O_CREATE != 0 && flag&os.O_TRUNC != 0 &&
+		(flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0) &&
+		flag&os.O_APPEND == 0
+
+	if !isAtomicWrite {
+		return fsys.dir.OpenFile(ctx, name, flag, perm)
+	}
+
+	// Stage the upload in a random-named temp file. os.CreateTemp uses
+	// crypto/rand internally; no timestamp-based pseudo-random seed.
+	tmpFile, err := os.CreateTemp(fsys.absTempDir, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// os.CreateTemp always creates files with 0600; apply the
+	// permission requested by the handler so the published file
+	// matches the semantics of a direct write.
+	if err := tmpFile.Chmod(perm); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return nil, err
+	}
+
+	return &atomicFile{
+		File:      tmpFile,
+		tmpPath:   tmpFile.Name(),
+		finalPath: fsys.resolve(name),
+		logger:    fsys.logger,
+	}, nil
+}
+
+// resolve converts a WebDAV slash-separated path into an absolute
+// filesystem path under absRoot, mirroring webdav.Dir's resolution.
+func (fsys *atomicFS) resolve(name string) string {
+	name = filepath.FromSlash(strings.TrimPrefix(filepath.Clean("/"+name), "/"))
+	return filepath.Join(fsys.absRoot, name)
+}
+
+// atomicFile wraps a staged temp file and publishes it to the final
+// path only when Close() is called after a fully successful write.
+type atomicFile struct {
+	webdav.File
+	tmpPath   string
+	finalPath string
+	logger    *zap.Logger
+	mu        sync.Mutex
+	writeErr  error
+	closed    bool
+}
+
+func (f *atomicFile) Write(p []byte) (int, error) {
+	n, err := f.File.Write(p)
+	if err != nil {
+		f.mu.Lock()
+		f.writeErr = err
+		f.mu.Unlock()
+	}
+	return n, err
+}
+
+// Close publishes the staged file. If any earlier write failed, the
+// fragment is discarded and the final path is never touched.
+func (f *atomicFile) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+
+	// A failed write means the temp file is incomplete; discard it
+	// without publishing.
+	if f.writeErr != nil {
+		closeErr := f.File.Close()
+		_ = os.Remove(f.tmpPath)
+		if closeErr != nil {
+			return closeErr
+		}
+		return f.writeErr
+	}
+
+	// Close the underlying handle before moving the file.
+	if err := f.File.Close(); err != nil {
+		_ = os.Remove(f.tmpPath)
+		return err
+	}
+
+	// Publish atomically. If the temp directory and the destination
+	// live on different file systems, os.Rename fails with EXDEV and
+	// we fall back to copy + metadata restore + delete.
+	if err := os.Rename(f.tmpPath, f.finalPath); err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			copyErr := f.copyFallback()
+			// Best-effort temp cleanup; copyFallback already removed
+			// the source on success.
+			_ = os.Remove(f.tmpPath)
+			return copyErr
+		}
+		_ = os.Remove(f.tmpPath)
+		return err
+	}
+	return nil
+}
+
+// copyFallback copies the staged temp file to the final destination,
+// restores the previous target's access/modification times and
+// permission bits, then removes the temp source. If the copy fails
+// midway, the incomplete destination file is removed and an error is
+// returned, so readers never see a partial file.
+func (f *atomicFile) copyFallback() error {
+	// Capture metadata of an existing target before overwriting, so
+	// it can be restored onto the new content afterwards.
+	var prevInfo os.FileInfo
+	info, err := os.Stat(f.finalPath)
+	if err == nil {
+		prevInfo = info
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	var perm os.FileMode = defaultFilePerm
+	if prevInfo != nil {
+		perm = prevInfo.Mode()
+	}
+
+	src, err := os.Open(f.tmpPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(f.finalPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+
+	buf := copyBufPool.Get().([]byte)
+	_, copyErr := io.CopyBuffer(dst, src, buf)
+	copyBufPool.Put(buf)
+	closeErr := dst.Close()
+
+	if copyErr != nil || closeErr != nil {
+		// Never leave a partially-copied destination behind.
+		_ = os.Remove(f.finalPath)
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}
+
+	// Restore the original access time, modification time, and
+	// permission bits onto the new content.
+	if prevInfo != nil {
+		atime := prevInfo.ModTime()
+		if st, ok := prevInfo.Sys().(*syscall.Stat_t); ok {
+			atime = time.Unix(st.Atim.Sec, st.Atim.Nsec)
+		}
+		if err := os.Chtimes(f.finalPath, atime, prevInfo.ModTime()); err != nil {
+			f.logger.Warn("could not restore file times after cross-device copy",
+				zap.String("path", f.finalPath),
+				zap.Error(err),
+			)
+		}
+		if err := os.Chmod(f.finalPath, prevInfo.Mode()); err != nil {
+			f.logger.Warn("could not restore file permissions after cross-device copy",
+				zap.String("path", f.finalPath),
+				zap.Error(err),
+			)
+		}
+	}
+
+	return os.Remove(f.tmpPath)
+}
 
 // Interface guards
 var (
