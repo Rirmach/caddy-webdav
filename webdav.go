@@ -511,8 +511,9 @@ func (f *atomicFile) Close() error {
 	if err := os.Rename(f.tmpPath, f.finalPath); err != nil {
 		if errors.Is(err, syscall.EXDEV) {
 			copyErr := f.copyFallback()
-			// Best-effort temp cleanup; copyFallback already removed
-			// the source on success.
+			// Remove the staged temp source; copyFallback renamed the
+			// destination-side temp file onto the final path but does
+			// not remove the original source.
 			_ = os.Remove(f.tmpPath)
 			return copyErr
 		}
