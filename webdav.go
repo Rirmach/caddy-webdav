@@ -54,8 +54,17 @@ const (
 	// result of a direct write under the common umask 022.
 	defaultFilePerm = 0o644
 
-	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB).
+	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB),
+	// matching the maximum ZFS record size for efficient full-record writes.
 	copyBufferSize = 1 << 20
+
+	// smallCopyBufferSize is the buffer used for small files in the EXDEV
+	// copy fallback (128KB, matching the default ZFS record size).
+	smallCopyBufferSize = 128 << 10
+
+	// smallFileThreshold: files at or below this size are copied with
+	// smallCopyBufferSize instead of copyBufferSize.
+	smallFileThreshold = 128 << 10
 
 	// staleTempFileMaxAge is the age after which leftover temp files are
 	// removed during one-time initialization.
@@ -66,6 +75,11 @@ const (
 // avoid per-upload heap allocations.
 var copyBufPool = sync.Pool{
 	New: func() any { return make([]byte, copyBufferSize) },
+}
+
+// smallCopyBufPool recycles 128KB buffers for small-file copies.
+var smallCopyBufPool = sync.Pool{
+	New: func() any { return make([]byte, smallCopyBufferSize) },
 }
 
 // bodyTrackerCtxKey is the context key carrying the per-request upload
@@ -540,6 +554,10 @@ func (f *atomicFile) copyFallback() error {
 	}
 	defer src.Close()
 
+	// Stat the source once: the size selects the copy buffer pool, and
+	// the mode is later applied to the destination-side temp file.
+	srcInfo, statErr := src.Stat()
+
 	// Stage the copy in the destination directory so the final rename
 	// always happens within a single filesystem.
 	dstTmp, err := os.CreateTemp(filepath.Dir(f.finalPath), "")
@@ -548,9 +566,15 @@ func (f *atomicFile) copyFallback() error {
 	}
 	dstTmpPath := dstTmp.Name()
 
-	buf := copyBufPool.Get().([]byte)
+	// Pick the buffer pool by file size and always return the buffer
+	// to the same pool it came from.
+	pool := &copyBufPool
+	if statErr == nil && srcInfo.Size() <= smallFileThreshold {
+		pool = &smallCopyBufPool
+	}
+	buf := pool.Get().([]byte)
 	_, copyErr := io.CopyBuffer(dstTmp, src, buf)
-	copyBufPool.Put(buf)
+	pool.Put(buf)
 	closeErr := dstTmp.Close()
 	if copyErr != nil || closeErr != nil {
 		// Never leave a partially-copied file behind. The previous
@@ -564,7 +588,7 @@ func (f *atomicFile) copyFallback() error {
 
 	// The staged source already carries the final permission bits,
 	// applied by Close before the rename attempt.
-	if srcInfo, err := src.Stat(); err == nil {
+	if statErr == nil {
 		if err := os.Chmod(dstTmpPath, srcInfo.Mode()); err != nil {
 			f.logger.Warn("could not apply file permissions after cross-device copy",
 				zap.String("path", f.finalPath),
