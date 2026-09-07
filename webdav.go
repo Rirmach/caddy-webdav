@@ -243,6 +243,13 @@ func (wd *WebDAV) lazyInit(repl *caddy.Replacer) {
 	}
 	wd.absTempDir = absTempDir
 
+	// Log the resolved temp directory once per process lifetime so
+	// operators can verify the feature is active and where uploads
+	// are staged.
+	wd.logger.Info("atomic upload enabled",
+		zap.String("temp_dir", wd.absTempDir),
+	)
+
 	// Cleanup is best-effort and can be slow on network filesystems
 	// with many leftovers; fire it in the background so the first
 	// request is not blocked. It runs at most once per process
