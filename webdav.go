@@ -55,11 +55,12 @@ const (
 	// result of a direct write under the common umask 022.
 	defaultFilePerm = 0o644
 
-	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB)
+	// copyBufferSize is the buffer size for the EXDEV copy fallback
+	// (1MB), minimizing write syscalls for large files.
 	copyBufferSize = 1 << 20
 
-	// smallCopyBufferSize is the buffer used for small files in the EXDEV
-	// copy fallback
+	// smallCopyBufferSize is the buffer used for small files in the
+	// EXDEV copy fallback (128KB), reducing pooled memory residency.
 	smallCopyBufferSize = 128 << 10
 
 	// smallFileThreshold: files at or below this size are copied with
@@ -648,7 +649,9 @@ func (f *atomicFile) Close() error {
 	// existing target passes on its mode; new files get the documented
 	// default (matching the common umask 022 result of a direct write).
 	// os.Chmod bypasses umask, so replicating arbitrary umask semantics
-	// for new files is not possible portably.
+	// for new files is not possible portably. Any stat failure (target
+	// missing or otherwise unreadable) implicitly falls back to the
+	// default permission.
 	var perm os.FileMode = defaultFilePerm
 	if info, err := os.Stat(f.finalPath); err == nil {
 		perm = info.Mode()
@@ -722,14 +725,18 @@ func (f *atomicFile) copyFallback() error {
 	}
 
 	// The staged source already carries the final permission bits,
-	// applied by Close before the rename attempt.
+	// applied by Close before the rename attempt. If its stat failed,
+	// fall back to the default permission so the published file never
+	// leaks the 0600 mode that os.CreateTemp creates.
+	var perm os.FileMode = defaultFilePerm
 	if statErr == nil {
-		if err := os.Chmod(dstTmpPath, srcInfo.Mode()); err != nil {
-			f.logger.Warn("could not apply file permissions after cross-device copy",
-				zap.String("path", f.finalPath),
-				zap.Error(err),
-			)
-		}
+		perm = srcInfo.Mode()
+	}
+	if err := os.Chmod(dstTmpPath, perm); err != nil {
+		f.logger.Warn("could not apply file permissions after cross-device copy",
+			zap.String("path", f.finalPath),
+			zap.Error(err),
+		)
 	}
 
 	// Atomically replace the target; the old content survives every
