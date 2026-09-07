@@ -69,6 +69,11 @@ const (
 	// staleTempFileMaxAge is the age after which leftover temp files are
 	// removed during one-time initialization.
 	staleTempFileMaxAge = 30 * 24 * time.Hour
+
+	// placeholderOpen mirrors the unexported phOpen constant in Caddy's
+	// replacer (the opening delimiter of placeholders). Used to detect
+	// dynamic, placeholder-bearing config values.
+	placeholderOpen = "{"
 )
 
 // copyBufPool recycles 1MB buffers used by the EXDEV copy fallback to
@@ -194,7 +199,7 @@ func (wd *WebDAV) Provision(ctx caddy.Context) error {
 	// request, so the temp directory cannot be derived from it.
 	// Fail fast at provision time instead of surprising the first
 	// request or silently degrading the atomicity guarantee.
-	if wd.AtomicUpload && strings.Contains(wd.Root, "{") && wd.TempFileDir == "" {
+	if wd.AtomicUpload && strings.Contains(wd.Root, placeholderOpen) && wd.TempFileDir == "" {
 		return fmt.Errorf("atomic upload requires an explicit temp_file_dir when root contains placeholders (root: %s); "+
 			"either set temp_file_dir, or leave atomic_upload disabled", wd.Root)
 	}
@@ -310,8 +315,7 @@ func (wd *WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	root := repl.ReplaceAll(wd.Root, ".")
 	prefix := repl.ReplaceAll(wd.Prefix, "")
 
-	// The filesystem defaults to upstream behavior (direct writes).
-	var wdFs webdav.FileSystem = webdav.Dir(root)
+	var wdFs webdav.FileSystem
 
 	if wd.AtomicUpload {
 		// One-time lazy initialization of the temp directory. A
@@ -341,6 +345,10 @@ func (wd *WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		wdFs = newAtomicFS(absRoot, wd.absTempDir, wd.logger)
+	} else {
+		// Upstream behavior: direct writes against the per-request
+		// resolved root, with no temp directory machinery involved.
+		wdFs = webdav.Dir(root)
 	}
 
 	wdHandler := webdav.Handler{
