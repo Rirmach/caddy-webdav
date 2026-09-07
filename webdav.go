@@ -135,23 +135,38 @@ type WebDAV struct {
 	// Accepts placeholders.
 	Prefix string `json:"prefix,omitempty"`
 
+	// AtomicUpload enables "write to temp file, then atomically move"
+	// for PUT uploads, so readers only ever see a complete file or no
+	// file at all. It is DISABLED by default: when off, the handler
+	// behaves exactly like upstream (direct writes, per-request root
+	// resolution, no temp directory machinery at all).
+	//
+	// When enabled and Root contains placeholders (i.e. it is
+	// resolved per request), TempFileDir MUST be set explicitly,
+	// because the temp directory cannot be derived from a
+	// request-dependent root. Provisioning fails otherwise.
+	AtomicUpload bool `json:"atomic_upload,omitempty"`
+
 	// TempFileDir is the directory where uploads are staged as
 	// temporary files before being atomically moved to their final
 	// destination. If empty, it defaults to a ".caddy_webdav_temp"
-	// directory inside the resolved Root. Accepts placeholders.
+	// directory inside the resolved Root (only allowed when Root is
+	// static). Accepts placeholders, but is resolved EXACTLY ONCE on
+	// the first request and stays fixed for the process lifetime;
+	// if a fixed temp directory is unacceptable, leave AtomicUpload
+	// disabled instead. Only effective when AtomicUpload is enabled.
 	TempFileDir string `json:"temp_file_dir,omitempty"`
 
 	lockSystem webdav.LockSystem
 	logger     *zap.Logger
 
-	// initOnce runs the one-time filesystem initialization lazily on
-	// the first request. It is a pointer so that the struct can be
+	// initOnce runs the one-time temp directory initialization lazily
+	// on the first request. It is a pointer so that the struct can be
 	// safely copied by value (e.g. by the CaddyModule value receiver).
 	// initErr persists an initialization failure so every later
 	// request fails fast with HTTP 500.
 	initOnce   *sync.Once
 	initErr    error
-	absRoot    string
 	absTempDir string
 }
 
@@ -175,25 +190,45 @@ func (wd *WebDAV) Provision(ctx caddy.Context) error {
 		wd.Root = "{http.vars.root}"
 	}
 
+	// A dynamic (placeholder-bearing) Root is only resolved per
+	// request, so the temp directory cannot be derived from it.
+	// Fail fast at provision time instead of surprising the first
+	// request or silently degrading the atomicity guarantee.
+	if wd.AtomicUpload && strings.Contains(wd.Root, "{") && wd.TempFileDir == "" {
+		return fmt.Errorf("atomic upload requires an explicit temp_file_dir when root contains placeholders (root: %s); "+
+			"either set temp_file_dir, or leave atomic_upload disabled", wd.Root)
+	}
+
+	// Warn when temp_file_dir is set but atomic upload is disabled:
+	// the setting has no effect and likely indicates a
+	// misconfiguration (e.g. a typo'd or forgotten atomic_upload).
+	if !wd.AtomicUpload && wd.TempFileDir != "" {
+		wd.logger.Warn("temp_file_dir is set but atomic_upload is disabled; the temp directory will not be used")
+	}
+
 	return nil
 }
 
-// lazyInit performs the one-time filesystem initialization: resolving
-// Root and TempFileDir to absolute paths, creating the temp directory,
+// lazyInit performs the one-time temp directory initialization:
+// resolving TempFileDir to an absolute path, creating the directory,
 // and removing stale leftover temp files. Any fatal failure is stored
 // in initErr; there is intentionally no fallback to the system /tmp.
+//
+// The temp directory is resolved exactly once per process lifetime.
+// Root itself is NOT resolved here: it may contain placeholders and
+// is resolved per request in ServeHTTP.
 func (wd *WebDAV) lazyInit(repl *caddy.Replacer) {
-	root := repl.ReplaceAll(wd.Root, ".")
-
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		wd.initErr = err
-		return
-	}
-	wd.absRoot = absRoot
-
 	tempDir := repl.ReplaceAll(wd.TempFileDir, "")
 	if tempDir == "" {
+		// TempFileDir unset: Root is guaranteed to be static here,
+		// because Provision rejects a dynamic Root without an
+		// explicit TempFileDir. Derive the default next to Root.
+		root := repl.ReplaceAll(wd.Root, ".")
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			wd.initErr = err
+			return
+		}
 		tempDir = filepath.Join(absRoot, defaultTempDirName)
 	}
 	absTempDir, err := filepath.Abs(tempDir)
@@ -265,29 +300,45 @@ func (wd *WebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// write methods: POST, PUT, PATCH, DELETE, COPY, MKCOL, MOVE, PROPPATCH
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	root := repl.ReplaceAll(wd.Root, ".")
 	prefix := repl.ReplaceAll(wd.Prefix, "")
 
-	// For PUT uploads, wrap the request body so read-side failures
-	// (client disconnects, truncated transfers) become visible to the
-	// atomic file's Close, which would otherwise only see write-side
-	// errors and could publish a partial file.
-	if r.Method == http.MethodPut {
-		tracker := &bodyTracker{contentLength: r.ContentLength}
-		r.Body = &trackingReadCloser{ReadCloser: r.Body, tracker: tracker}
+	// The filesystem defaults to upstream behavior (direct writes).
+	var wdFs webdav.FileSystem = webdav.Dir(root)
 
-		r = r.WithContext(context.WithValue(r.Context(), bodyTrackerCtxKey{}, tracker))
-	}
+	if wd.AtomicUpload {
+		// One-time lazy initialization of the temp directory. A
+		// persisted initialization error fails every request fast
+		// with HTTP 500.
+		wd.initOnce.Do(func() { wd.lazyInit(repl) })
+		if wd.initErr != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, wd.initErr)
+		}
 
-	// One-time lazy initialization of the temp directory. A persisted
-	// initialization error fails every request fast with HTTP 500.
-	wd.initOnce.Do(func() { wd.lazyInit(repl) })
-	if wd.initErr != nil {
-		return caddyhttp.Error(http.StatusInternalServerError, wd.initErr)
+		// Resolve the root per request: it may contain placeholders
+		// (e.g. multi-tenant roots). A resolution failure is a
+		// per-request error and must not be persisted.
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+
+		// For PUT uploads, wrap the request body so read-side failures
+		// (client disconnects, truncated transfers) become visible to
+		// the atomic file's Close, which would otherwise only see
+		// write-side errors and could publish a partial file.
+		if r.Method == http.MethodPut {
+			tracker := &bodyTracker{contentLength: r.ContentLength}
+			r.Body = &trackingReadCloser{ReadCloser: r.Body, tracker: tracker}
+			r = r.WithContext(context.WithValue(r.Context(), bodyTrackerCtxKey{}, tracker))
+		}
+
+		wdFs = newAtomicFS(absRoot, wd.absTempDir, wd.logger)
 	}
 
 	wdHandler := webdav.Handler{
 		Prefix:     prefix,
-		FileSystem: newAtomicFS(wd.absRoot, wd.absTempDir, wd.logger),
+		FileSystem: wdFs,
 		LockSystem: wd.lockSystem,
 		Logger: func(req *http.Request, err error) {
 			if err == nil {
