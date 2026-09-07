@@ -36,6 +36,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
+	"golang.org/x/sync/singleflight"
 )
 
 // Configurable values and thresholds for atomic uploads. All tunables
@@ -67,8 +68,15 @@ const (
 	smallFileThreshold = 128 << 10
 
 	// staleTempFileMaxAge is the age after which leftover temp files are
-	// removed during one-time initialization.
-	staleTempFileMaxAge = 30 * 24 * time.Hour
+	// considered orphans and removed by the periodic cleanup. It must
+	// stay far longer than any plausible upload duration, since cleanup
+	// also runs while uploads are in flight (and, on shared filesystems,
+	// while OTHER instances may be staging uploads in the same
+	// directory).
+	staleTempFileMaxAge = 7 * 24 * time.Hour
+
+	// cleanupInterval is how often the stale temp file cleanup runs.
+	cleanupInterval = 24 * time.Hour
 
 	// placeholderOpen mirrors the unexported phOpen constant in Caddy's
 	// replacer (the opening delimiter of placeholders). Used to detect
@@ -86,6 +94,12 @@ var copyBufPool = sync.Pool{
 var smallCopyBufPool = sync.Pool{
 	New: func() any { return make([]byte, smallCopyBufferSize) },
 }
+
+// cleanupGroup deduplicates stale-temp-file cleanup across handler
+// instances: multiple WebDAV instances configured with the same temp
+// directory share a single cleanup run instead of scanning (and
+// racing removes in) the same directory concurrently.
+var cleanupGroup singleflight.Group
 
 // bodyTrackerCtxKey is the context key carrying the per-request upload
 // body tracker from ServeHTTP down to atomicFile.
@@ -216,8 +230,9 @@ func (wd *WebDAV) Provision(ctx caddy.Context) error {
 
 // lazyInit performs the one-time temp directory initialization:
 // resolving TempFileDir to an absolute path, creating the directory,
-// and removing stale leftover temp files. Any fatal failure is stored
-// in initErr; there is intentionally no fallback to the system /tmp.
+// and starting the periodic stale temp file cleanup. Any fatal
+// failure is stored in initErr; there is intentionally no fallback
+// to the system /tmp.
 //
 // The temp directory is resolved exactly once per process lifetime.
 // Root itself is NOT resolved here: it may contain placeholders and
@@ -256,17 +271,37 @@ func (wd *WebDAV) lazyInit(repl *caddy.Replacer) {
 	)
 
 	// Cleanup is best-effort and can be slow on network filesystems
-	// with many leftovers; fire it in the background so the first
-	// request is not blocked. It runs at most once per process
-	// lifetime (guarded by initOnce); files that cannot be removed
-	// are simply left for the next process start.
-	go wd.cleanStaleTempFiles()
+	// with many leftovers; run it periodically in the background so
+	// requests are never blocked. The goroutine intentionally has no
+	// graceful shutdown: cleanup is idempotent, so process exit can
+	// simply cut it off mid-run.
+	go wd.periodicCleanup()
+}
+
+// periodicCleanup runs the stale temp file cleanup immediately and
+// then once every cleanupInterval for the process lifetime.
+func (wd *WebDAV) periodicCleanup() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		// Deduplicate concurrent cleanups of the same temp directory
+		// across handler instances; a concurrent caller simply shares
+		// the in-flight run instead of scanning the same directory.
+		_, _, _ = cleanupGroup.Do(wd.absTempDir, func() (any, error) {
+			wd.cleanStaleTempFiles()
+			return nil, nil
+		})
+		<-ticker.C
+	}
 }
 
 // cleanStaleTempFiles removes leftover temp files whose modification
 // time is older than staleTempFileMaxAge. It scans only the top level
 // of the temp directory (temp files never live in subdirectories) and
 // continues past per-file failures, logging them at Warn level.
+// Concurrent runs for the same directory are deduplicated by the
+// caller via cleanupGroup.
 func (wd *WebDAV) cleanStaleTempFiles() {
 	entries, err := os.ReadDir(wd.absTempDir)
 	if err != nil {
