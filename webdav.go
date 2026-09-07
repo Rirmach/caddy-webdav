@@ -55,12 +55,11 @@ const (
 	// result of a direct write under the common umask 022.
 	defaultFilePerm = 0o644
 
-	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB),
-	// matching the maximum ZFS record size for efficient full-record writes.
+	// copyBufferSize is the buffer size for the EXDEV copy fallback (1MB)
 	copyBufferSize = 1 << 20
 
 	// smallCopyBufferSize is the buffer used for small files in the EXDEV
-	// copy fallback (128KB, matching the default ZFS record size).
+	// copy fallback
 	smallCopyBufferSize = 128 << 10
 
 	// smallFileThreshold: files at or below this size are copied with
