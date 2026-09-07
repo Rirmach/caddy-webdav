@@ -404,6 +404,14 @@ func (fsys *atomicFS) OpenFile(ctx context.Context, name string, flag int, perm 
 		return fsys.dir.OpenFile(ctx, name, flag, perm)
 	}
 
+	// Reject paths that webdav.Dir would reject, before doing any
+	// filesystem work, so the error semantics match the passthrough
+	// path (open-time os.ErrNotExist instead of a late rename failure).
+	finalPath := fsys.resolve(name)
+	if finalPath == "" {
+		return nil, os.ErrNotExist
+	}
+
 	// Stage the upload in a random-named temp file. os.CreateTemp uses
 	// crypto/rand internally; no timestamp-based pseudo-random seed.
 	// The temp file keeps its restrictive 0600 permission while staged;
@@ -422,7 +430,7 @@ func (fsys *atomicFS) OpenFile(ctx context.Context, name string, flag int, perm 
 	return &atomicFile{
 		File:      tmpFile,
 		tmpPath:   tmpFile.Name(),
-		finalPath: fsys.resolve(name),
+		finalPath: finalPath,
 		logger:    fsys.logger,
 		tracker:   tracker,
 	}, nil
@@ -430,7 +438,15 @@ func (fsys *atomicFS) OpenFile(ctx context.Context, name string, flag int, perm 
 
 // resolve converts a WebDAV slash-separated path into an absolute
 // filesystem path under absRoot, mirroring webdav.Dir's resolution.
+// It returns an empty string for names that webdav.Dir rejects:
+// those containing NUL bytes or, on Windows, misplaced path
+// separators. Cleaning is anchored at "/" so ".." segments can never
+// escape absRoot.
 func (fsys *atomicFS) resolve(name string) string {
+	if strings.Contains(name, "\x00") ||
+		(filepath.Separator != '/' && strings.IndexRune(name, filepath.Separator) >= 0) {
+		return ""
+	}
 	name = filepath.FromSlash(strings.TrimPrefix(filepath.Clean("/"+name), "/"))
 	return filepath.Join(fsys.absRoot, name)
 }
