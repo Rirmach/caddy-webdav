@@ -187,6 +187,11 @@ type WebDAV struct {
 	initOnce   *sync.Once
 	initErr    error
 	absTempDir string
+
+	// ctx is the provisioning context; it is canceled when this config
+	// generation is unloaded (e.g. on reload), and terminates the
+	// cleanup goroutine so instance turnover does not leak it.
+	ctx context.Context
 }
 
 // CaddyModule returns the Caddy module information.
@@ -203,6 +208,7 @@ func (WebDAV) CaddyModule() caddy.ModuleInfo {
 func (wd *WebDAV) Provision(ctx caddy.Context) error {
 	wd.logger = ctx.Logger(wd)
 	wd.initOnce = new(sync.Once)
+	wd.ctx = ctx
 
 	wd.lockSystem = webdav.NewMemLS()
 	if wd.Root == "" {
@@ -272,19 +278,27 @@ func (wd *WebDAV) lazyInit(repl *caddy.Replacer) {
 
 	// Cleanup is best-effort and can be slow on network filesystems
 	// with many leftovers; run it periodically in the background so
-	// requests are never blocked. The goroutine intentionally has no
-	// graceful shutdown: cleanup is idempotent, so process exit can
-	// simply cut it off mid-run.
+	// requests are never blocked.
 	go wd.periodicCleanup()
 }
 
 // periodicCleanup runs the stale temp file cleanup immediately and
-// then once every cleanupInterval for the process lifetime.
+// then once every cleanupInterval. It exits when the provisioning
+// context is canceled (config reload/unload), so instance turnover
+// does not leak the goroutine. A cleanup already in flight is not
+// interrupted: it is idempotent, and process exit may simply cut it
+// off mid-run.
 func (wd *WebDAV) periodicCleanup() {
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
 	for {
+		select {
+		case <-wd.ctx.Done():
+			return
+		default:
+		}
+
 		// Deduplicate concurrent cleanups of the same temp directory
 		// across handler instances; a concurrent caller simply shares
 		// the in-flight run instead of scanning the same directory.
@@ -292,7 +306,12 @@ func (wd *WebDAV) periodicCleanup() {
 			wd.cleanStaleTempFiles()
 			return nil, nil
 		})
-		<-ticker.C
+
+		select {
+		case <-wd.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
